@@ -2,8 +2,8 @@ import sys, cv2, numpy as np
 from scipy.spatial import Delaunay
 from insightface.app import FaceAnalysis
 
-src_path, vin, vout = sys.argv[1:4]
-debug_frames = [int(x) for x in sys.argv[4].split(",")] if len(sys.argv) > 4 else None
+src_path, vin, vout, vorig = sys.argv[1:5]   # vin = face-swapped video, vorig = original video
+debug_frames = [int(x) for x in sys.argv[5].split(",")] if len(sys.argv) > 5 else None
 
 app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"],
                    allowed_modules=["detection", "landmark_2d_106"])
@@ -91,42 +91,79 @@ def warp(img, src_pts, dst_pts, shape):
         out[y0:y1, x0:x1] = out[y0:y1, x0:x1] * (1 - mm) + p * mm
     return out
 
-cap = cv2.VideoCapture(vin)
-fps = cap.get(cv2.CAP_PROP_FPS); W, H = int(cap.get(3)), int(cap.get(4))
-writer = None if debug_frames else cv2.VideoWriter(vout, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
-smooth = None; n = 0
+INNER = [54, 57, 60, 62, 65, 66, 69, 70]
+
+# ---- pass 1: left-face landmarks from the ORIGINAL video (true mouth motion) ----
+capo = cv2.VideoCapture(vorig)
+W, H = int(capo.get(3)), int(capo.get(4)); fps = capo.get(cv2.CAP_PROP_FPS)
+lms, widths = [], []
+n = 0
 while True:
-    ok, frame = cap.read()
-    if not ok: break
-    if debug_frames and n > max(debug_frames): break
-    faces = [f for f in app.get(frame) if f.det_score > 0.5 and (f.bbox[0] + f.bbox[2]) / 2 < W * 0.5]
+    ok, fr = capo.read()
+    if not ok or (debug_frames and n > max(debug_frames)): break
+    fs = [f for f in app.get(fr) if f.det_score > 0.5 and (f.bbox[0] + f.bbox[2]) / 2 < W * 0.5]
+    if fs:
+        f = max(fs, key=lambda f: f.bbox[2] - f.bbox[0])
+        lms.append(f.landmark_2d_106.astype(np.float32)); widths.append(f.bbox[2] - f.bbox[0])
+    else:
+        lms.append(None); widths.append(None)
+    n += 1
+print("landmarks collected", n, flush=True)
+
+# zero-phase (centred) smoothing: no lag, breaks at detection gaps / big jumps
+SIG = 1.2
+smoothed = [None] * len(lms)
+for t, lm in enumerate(lms):
+    if lm is None: continue
+    acc, wsum = np.zeros_like(lm), 0.0
+    for d in range(-3, 4):
+        u = t + d
+        if 0 <= u < len(lms) and lms[u] is not None and np.abs(lms[u] - lm).mean() < 0.12 * widths[t]:
+            w = np.exp(-d * d / (2 * SIG * SIG)); acc += w * lms[u]; wsum += w
+    smoothed[t] = acc / wsum
+
+# ---- pass 2 ----
+cap = cv2.VideoCapture(vin); capo = cv2.VideoCapture(vorig)
+writer = None if debug_frames else cv2.VideoWriter(vout, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+for n in range(len(lms)):
+    ok, frame = cap.read(); ok2, orig = capo.read()
+    if not ok or not ok2: break
     out = frame
-    if faces:
-        f = max(faces, key=lambda f: f.bbox[2] - f.bbox[0])
-        lm = f.landmark_2d_106.astype(np.float32)
-        if smooth is None or np.abs(lm - smooth).mean() > 0.15 * (f.bbox[2] - f.bbox[0]):
-            smooth = lm
-        else:
-            smooth = 0.55 * lm + 0.45 * smooth
-        dst_ctrl = control(smooth)
+    if lms[n] is not None:
+        raw, sm, fwid = lms[n], smoothed[n], widths[n]
         g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
         tcheek = np.zeros(g.shape, np.float32)
-        cv2.fillPoly(tcheek, [np.vstack([smooth[[9, 10, 11]], smooth[[76, 74]]]).astype(np.int32)], 1)
+        cv2.fillPoly(tcheek, [np.vstack([sm[[9, 10, 11]], sm[[76, 74]]]).astype(np.int32)], 1)
         gain = (g[tcheek > 0].mean() / src_skin) if tcheek.sum() > 20 else 1.0
-        beard = warp(sgray, src_ctrl, dst_ctrl, g.shape) * gain
+        dst_ctrl = control(sm)
+        beard = cv2.GaussianBlur(warp(sgray, src_ctrl, dst_ctrl, g.shape) * gain, (0, 0), 0.6)
         m = warp(smask, src_ctrl, dst_ctrl, g.shape)
-        fw = max(2.0, 0.035 * (f.bbox[2] - f.bbox[0]))
-        m = cv2.GaussianBlur(m, (0, 0), fw)
-        # slight blur so the photo's detail matches the softer video
-        beard = cv2.GaussianBlur(beard, (0, 0), 0.6)
+        # mouth hole cut from this frame's real lips, so the beard never covers them
+        lipm = np.zeros(g.shape, np.float32)
+        cv2.fillConvexPoly(lipm, cv2.convexHull(raw[OUTER_LIP].astype(np.int32)), 1)
+        k = max(3, int(fwid * 0.04)) | 1
+        lipm = cv2.dilate(lipm, np.ones((k, k), np.uint8))
+        m *= 1 - lipm
+        m = cv2.GaussianBlur(m, (0, 0), max(2.0, 0.035 * fwid))
         b3 = np.repeat(beard[..., None], 3, 2)
-        out = (frame * (1 - m[..., None]) + b3 * m[..., None]).clip(0, 255).astype(np.uint8)
+        out = frame * (1 - m[..., None]) + b3 * m[..., None]
+        # restore the original lips + mouth interior (true lip-sync), feathered
+        mouth = np.zeros(g.shape, np.float32)
+        cv2.fillConvexPoly(mouth, cv2.convexHull(raw[OUTER_LIP].astype(np.int32)), 1)
+        mouth = cv2.GaussianBlur(mouth, (0, 0), max(1.5, 0.025 * fwid))
+        og = cv2.cvtColor(orig, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        # match original lips' brightness to the swapped face around them
+        ring = (cv2.dilate((mouth > 0.5).astype(np.uint8), np.ones((k * 2 + 1,) * 2, np.uint8)) > 0) & (mouth < 0.1)
+        if ring.sum() > 20:
+            og = og + (np.repeat(out.mean(2)[..., None], 1, 2)[..., 0][ring].mean() - og[ring].mean()) * 0.5
+        o3 = np.repeat(og[..., None], 3, 2)
+        mm = (mouth * 0.9)[..., None]
+        out = (out * (1 - mm) + o3 * mm).clip(0, 255).astype(np.uint8)
     if debug_frames:
         if n in debug_frames:
             cv2.imwrite(f"dbg_{n}.png", cv2.resize(out[300:700, 0:330], None, fx=2.5, fy=2.5))
     else:
         writer.write(out)
-    n += 1
     if n % 50 == 0: print(n, flush=True)
 if writer: writer.release()
-print("done", n)
+print("done", len(lms))
